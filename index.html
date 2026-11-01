@@ -112,6 +112,9 @@
     </div>
   </header>
 
+  <!-- Notification Toast Container -->
+  <div id="toastContainer" class="fixed top-16 left-1/2 -translate-x-1/2 z-50 w-11/12 max-w-md pointer-events-none space-y-2"></div>
+
   <!-- ================= MAIN CONTENT VIEWS ================= -->
   <main class="flex-1 max-w-md w-full mx-auto p-4 space-y-5">
 
@@ -411,7 +414,7 @@
   <!-- ================= FIREBASE MODULE & APPLICATION LOGIC ================= -->
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-    import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
     import { 
       getFirestore, 
       collection, 
@@ -435,6 +438,7 @@
     let app, db, auth;
     let fuelLogs = [];
     let serviceLogs = [];
+    let currentUser = null;
 
     let costBreakdownChart = null;
     let mileageBandChart = null;
@@ -444,17 +448,67 @@
     const APP_PASSWORD = "741223";
     const appId = typeof __app_id !== 'undefined' ? __app_id : 'petrol-tracker-app';
 
-    // Firebase Initialization
+    // Toast Notification System
+    function showToast(message, type = 'info') {
+      const container = document.getElementById('toastContainer');
+      if (!container) return;
+      
+      const toast = document.createElement('div');
+      const bgClass = type === 'error' ? 'bg-rose-500' : type === 'success' ? 'bg-emerald-600' : 'bg-indigo-600';
+      toast.className = `${bgClass} text-white text-xs px-4 py-2.5 rounded-xl shadow-lg flex items-center justify-between transition-all duration-300 opacity-0 transform translate-y-[-10px] pointer-events-auto`;
+      toast.innerHTML = `
+        <span>${message}</span>
+        <button onclick="this.parentElement.remove()" class="ml-2 text-white/80 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
+      `;
+      
+      container.appendChild(toast);
+      setTimeout(() => {
+        toast.classList.remove('opacity-0', 'translate-y-[-10px]');
+      }, 50);
+
+      setTimeout(() => {
+        toast.classList.add('opacity-0', 'translate-y-[-10px]');
+        setTimeout(() => toast.remove(), 300);
+      }, 3500);
+    }
+
+    // Firebase Initialization & Authentication Sequence
     try {
       app = initializeApp(firebaseConfig);
       db = getFirestore(app);
       auth = getAuth(app);
       
-      signInAnonymously(auth).then(() => {
+      // Mandatory: Authenticate FIRST before attached Firestore queries execute
+      signInAnonymously(auth).then((userCredential) => {
+        currentUser = userCredential.user;
+        const syncStatusEl = document.getElementById('syncStatus');
+        if (syncStatusEl) {
+          syncStatusEl.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span> Cloud Sync Active`;
+          syncStatusEl.className = "text-[10px] text-emerald-400 font-medium flex items-center gap-1";
+        }
         setupListeners();
-      }).catch(err => console.error("Auth error:", err));
+      }).catch(err => {
+        console.error("Auth error:", err);
+        showToast("Cloud authentication failed. Operating in Offline mode.", "error");
+        fallbackOffline();
+      });
+
     } catch (e) {
       console.warn("Firebase Init fallback offline", e);
+      fallbackOffline();
+    }
+
+    function fallbackOffline() {
+      const syncStatusEl = document.getElementById('syncStatus');
+      if (syncStatusEl) {
+        syncStatusEl.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span> Offline Mode`;
+        syncStatusEl.className = "text-[10px] text-amber-400 font-medium flex items-center gap-1";
+      }
+      const localFuel = localStorage.getItem('offline_fuel_logs');
+      if (localFuel) fuelLogs = JSON.parse(localFuel);
+      const localService = localStorage.getItem('offline_service_logs');
+      if (localService) serviceLogs = JSON.parse(localService);
+      processCalculationsAndRender();
     }
 
     // Date Default Setup
@@ -510,29 +564,40 @@
 
     checkAuth();
 
-    // Firestore Sync
+    // Firestore Listener Setup following Rule 1 & Rule 2
     function setupListeners() {
-      // 1. Fuel Logs
+      if (!currentUser && !auth.currentUser) return;
+
+      // Rule 1 mandatory path: /artifacts/{appId}/public/data/{collectionName}
       const fuelRef = collection(db, 'artifacts', appId, 'public', 'data', 'fuel_logs');
+      
+      // Listener with mandatory error handling
       onSnapshot(fuelRef, (snapshot) => {
         fuelLogs = [];
         snapshot.forEach((docSnap) => fuelLogs.push({ id: docSnap.id, ...docSnap.data() }));
+        // Memory sort to avoid compound index requirements
         fuelLogs.sort((a, b) => new Date(a.dateTime) - new Date(b.dateTime));
+        localStorage.setItem('offline_fuel_logs', JSON.stringify(fuelLogs));
         processCalculationsAndRender();
-      }, () => {
+      }, (error) => {
+        console.error("Firestore Fuel Log Error:", error);
+        showToast("Error syncing fuel logs from cloud", "error");
         const local = localStorage.getItem('offline_fuel_logs');
         if (local) fuelLogs = JSON.parse(local);
         processCalculationsAndRender();
       });
 
-      // 2. Service Logs
       const serviceRef = collection(db, 'artifacts', appId, 'public', 'data', 'service_logs');
+      
       onSnapshot(serviceRef, (snapshot) => {
         serviceLogs = [];
         snapshot.forEach((docSnap) => serviceLogs.push({ id: docSnap.id, ...docSnap.data() }));
         serviceLogs.sort((a, b) => new Date(b.serviceDate) - new Date(a.serviceDate));
+        localStorage.setItem('offline_service_logs', JSON.stringify(serviceLogs));
         processCalculationsAndRender();
-      }, () => {
+      }, (error) => {
+        console.error("Firestore Service Log Error:", error);
+        showToast("Error syncing service logs from cloud", "error");
         const local = localStorage.getItem('offline_service_logs');
         if (local) serviceLogs = JSON.parse(local);
         processCalculationsAndRender();
@@ -555,11 +620,15 @@
       };
 
       try {
-        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'fuel_logs'), logData);
+        const docRef = collection(db, 'artifacts', appId, 'public', 'data', 'fuel_logs');
+        await addDoc(docRef, logData);
+        showToast("Fuel fill-up saved to cloud!", "success");
       } catch (err) {
+        console.warn("Failed to write to cloud:", err);
         fuelLogs.push({ id: 'local_' + Date.now(), ...logData });
         localStorage.setItem('offline_fuel_logs', JSON.stringify(fuelLogs));
         processCalculationsAndRender();
+        showToast("Saved locally (Offline mode)", "info");
       }
 
       document.getElementById('addLogForm').reset();
@@ -582,11 +651,15 @@
       };
 
       try {
-        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'service_logs'), serviceData);
+        const docRef = collection(db, 'artifacts', appId, 'public', 'data', 'service_logs');
+        await addDoc(docRef, serviceData);
+        showToast("Service record saved to cloud!", "success");
       } catch (err) {
+        console.warn("Failed to write service log to cloud:", err);
         serviceLogs.push({ id: 'local_srv_' + Date.now(), ...serviceData });
         localStorage.setItem('offline_service_logs', JSON.stringify(serviceLogs));
         processCalculationsAndRender();
+        showToast("Saved service locally (Offline mode)", "info");
       }
 
       closeServiceModal();
@@ -598,8 +671,15 @@
     window.deleteLogItem = async function(id) {
       if (confirm("Delete this fuel log entry?")) {
         try {
-          await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'fuel_logs', id));
+          if (!id.startsWith('local_')) {
+            await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'fuel_logs', id));
+          }
+          fuelLogs = fuelLogs.filter(item => item.id !== id);
+          localStorage.setItem('offline_fuel_logs', JSON.stringify(fuelLogs));
+          processCalculationsAndRender();
+          showToast("Entry deleted successfully", "success");
         } catch (e) {
+          console.error("Delete error:", e);
           fuelLogs = fuelLogs.filter(item => item.id !== id);
           localStorage.setItem('offline_fuel_logs', JSON.stringify(fuelLogs));
           processCalculationsAndRender();
@@ -610,8 +690,15 @@
     window.deleteServiceItem = async function(id) {
       if (confirm("Delete this service record?")) {
         try {
-          await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'service_logs', id));
+          if (!id.startsWith('local_srv_')) {
+            await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'service_logs', id));
+          }
+          serviceLogs = serviceLogs.filter(item => item.id !== id);
+          localStorage.setItem('offline_service_logs', JSON.stringify(serviceLogs));
+          processCalculationsAndRender();
+          showToast("Service log deleted", "success");
         } catch (e) {
+          console.error("Delete service error:", e);
           serviceLogs = serviceLogs.filter(item => item.id !== id);
           localStorage.setItem('offline_service_logs', JSON.stringify(serviceLogs));
           processCalculationsAndRender();
